@@ -1,2 +1,19 @@
-# astrbot_plugin_163music_download
-AstrBot 网易云音乐插件：搜索歌曲、获取播放直链和歌词
+# AstrBot 网易云音乐插件
+
+搜索网易云歌曲，获取播放直链与歌词。支持直接发送网易云歌曲分享链接，并可在 AstrBot 插件配置界面填写 Cookie。
+
+## 安装与配置
+
+将插件放入 AstrBot 的 `data/plugins/astrbot_plugin_163music_download` 目录，安装 `requirements.txt` 中的依赖后重载插件。
+
+在 AstrBot 管理面板的「插件」中打开本插件配置，在「网易云音乐 Cookie」填写 `MUSIC_U` 的值或完整 Cookie，保存后重载插件。此字段会在界面中遮蔽，但 Cookie 仍会保存在 AstrBot 本机的插件配置文件中，请勿公开该文件。也可以通过 `NETEASE_MUSIC_COOKIE` 环境变量提供 Cookie。
+
+## 使用
+
+- `/网易云搜索 歌名或歌手`：返回最多 4 首歌曲；5 分钟内回复 `1`、`2`、`3` 或 `4` 选择歌曲，获取直链和歌词。
+- `/网易云链接 歌曲ID或歌曲链接`：获取该歌曲的直链和歌词。
+- `/网易云帮助`：查看命令。
+- 直接发送包含 `https://music.163.com/#/song?id=21088450` 或 `https://163cn.tv/biWjF4Mh` 的消息，也会自动识别并获取直链与歌词。链接前后可以有其他文字。
+
+短链需要联网解析。歌曲没有可用直链时，歌词仍会单独尝试获取；版权、账号权限或接口状态可能影响返回结果。
+

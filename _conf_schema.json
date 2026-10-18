@@ -1,0 +1,10 @@
+{
+  "music_cookie": {
+    "type": "string",
+    "description": "网易云音乐 Cookie",
+    "hint": "填写 MUSIC_U 的值或完整 Cookie。仅保存在 AstrBot 本机插件配置中，不要上传配置文件。",
+    "default": "",
+    "secret": true
+  }
+}
+
