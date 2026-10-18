@@ -3,6 +3,7 @@ import time
 
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import At, Node, Nodes, Plain
 from astrbot.api.star import Context, Star
 from astrbot.core.star.filter.command import GreedyStr
 
@@ -25,6 +26,14 @@ class MusicPlugin(Star):
     @staticmethod
     def _selection_key(event: AstrMessageEvent) -> tuple[str, str]:
         return (str(event.unified_msg_origin), str(event.get_sender_id()))
+
+    @staticmethod
+    def _is_at_bot(event: AstrMessageEvent) -> bool:
+        bot_id = str(event.get_self_id())
+        return bool(bot_id) and any(
+            isinstance(message, At) and str(message.qq) == bot_id
+            for message in event.get_messages()
+        )
 
     @staticmethod
     def _lyric_chunks(song_id: int, lyrics: dict[str, str]):
@@ -52,19 +61,29 @@ class MusicPlugin(Star):
             if chunk != prefix:
                 yield chunk.rstrip()
 
-    async def _song_results(self, event: AstrMessageEvent, song_id: int):
-        """分别取直链和歌词，任一项失败也不影响另一项。"""
+    async def _song_results(
+        self, event: AstrMessageEvent, song_id: int, selected_song: dict | None = None
+    ):
+        """分别获取直链和歌词，再合并为一条聊天记录发送。"""
+        parts = []
+        if selected_song:
+            parts.append(f"已选择：{selected_song['name']} - {selected_song['artists']}")
         try:
             url = await asyncio.to_thread(get_song_url, song_id, cookie=self.music_cookie)
-            yield event.plain_result(f"歌曲 ID：{song_id}\n播放直链：{url}")
+            parts.append(f"歌曲 ID：{song_id}\n播放直链：{url}")
         except (ValueError, MusicAPIError) as exc:
-            yield event.plain_result(f"歌曲 ID：{song_id}\n获取直链失败：{exc}")
+            parts.append(f"歌曲 ID：{song_id}\n获取直链失败：{exc}")
         try:
             lyrics = await asyncio.to_thread(get_lyrics, song_id, cookie=self.music_cookie)
-            for chunk in self._lyric_chunks(song_id, lyrics):
-                yield event.plain_result(chunk)
+            parts.extend(self._lyric_chunks(song_id, lyrics))
         except (ValueError, MusicAPIError) as exc:
-            yield event.plain_result(f"歌曲 ID：{song_id}\n获取歌词失败：{exc}")
+            parts.append(f"歌曲 ID：{song_id}\n获取歌词失败：{exc}")
+        bot_id = str(event.get_self_id() or "0")
+        nodes = [
+            Node(name="网易云音乐", uin=bot_id, content=[Plain(text=part)])
+            for part in parts
+        ]
+        yield event.chain_result([Nodes(nodes)])
 
     @filter.command("网易云帮助")
     async def help(self, event: AstrMessageEvent):
@@ -72,7 +91,7 @@ class MusicPlugin(Star):
             "网易云音乐命令：\n"
             "/网易云搜索 歌名或歌手（随后回复 1-4 选歌）\n"
             "/网易云链接 歌曲ID或含链接的文字\n"
-            "也可以直接发送网易云歌曲分享链接。"
+            "艾特机器人并附上网易云歌曲分享链接，也能获取直链和歌词。"
         )
 
     @filter.command("网易云搜索")
@@ -116,7 +135,7 @@ class MusicPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def auto_link(self, event: AstrMessageEvent):
-        """处理搜索后的数字选择，以及普通消息中的歌曲分享链接。"""
+        """处理搜索后的数字选择，以及艾特机器人时发送的歌曲分享链接。"""
         text = event.get_message_str().strip()
         if text in {"1", "2", "3", "4"}:
             key = self._selection_key(event)
@@ -133,11 +152,12 @@ class MusicPlugin(Star):
                     return
                 self._pending_selections.pop(key, None)
                 song = songs[index]
-                yield event.plain_result(f"已选择：{song['name']} - {song['artists']}")
-                async for result in self._song_results(event, int(song["id"])):
+                async for result in self._song_results(
+                    event, int(song["id"]), selected_song=song
+                ):
                     yield result
             return
-        if not match_music_link(text):
+        if not self._is_at_bot(event) or not match_music_link(text):
             return
         commands = (
             "网易云搜索", "网易云链接", "网易云帮助",
@@ -156,4 +176,4 @@ class MusicPlugin(Star):
             return
         async for result in self._song_results(event, song_id):
             yield result
-
+        event.stop_event()
