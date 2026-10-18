@@ -140,8 +140,8 @@ class MusicPlugin(Star):
         if not match_music_link(text):
             return
         commands = (
-            "163music_search", "163music_url", "163music_lyric", "163music_help",
-            "歌曲直链", "网易云音乐直链", "歌曲歌词",
+            "网易云搜索", "网易云链接", "网易云帮助",
+            "歌曲直链", "网易云音乐直链",
         )
         command_text = text.lstrip("/")
         if any(
