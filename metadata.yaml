@@ -1,6 +1,6 @@
 name: astrbot_plugin_163music_download
-display_name: 网易云音乐搜索、直链与歌词
-desc: 输入 /网易云帮助 查看搜索、直链和歌词命令
-version: 0.0.1
+display_name: 网易云音乐搜索、直链、歌词与语音
+desc: 输入 /网易云帮助 查看搜索、直链、歌词和语音命令
+version: 0.0.5
 author: 石枰
 repo: https://github.com/sunzhaocn/astrbot_plugin_163music_download

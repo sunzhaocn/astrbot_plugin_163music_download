@@ -1,16 +1,17 @@
 import asyncio
 import time
 
-from astrbot.api import AstrBotConfig
-from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import At, Node, Nodes, Plain
+from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.message_components import At, Node, Nodes, Plain, Record
+from astrbot.api.platform import MessageType
 from astrbot.api.star import Context, Star
 from astrbot.core.star.filter.command import GreedyStr
 
 from .netease_music import (
     MusicAPIError,
     get_lyrics,
-    get_song_url,
+    get_playable_song_url,
     match_music_link,
     parse_song_id,
     search_songs,
@@ -61,29 +62,43 @@ class MusicPlugin(Star):
             if chunk != prefix:
                 yield chunk.rstrip()
 
-    async def _song_results(
+    async def _send_song_results(
         self, event: AstrMessageEvent, song_id: int, selected_song: dict | None = None
-    ):
-        """分别获取直链和歌词，再合并为一条聊天记录发送。"""
+    ) -> None:
+        """Send the merged song details, followed by the playable voice message."""
         parts = []
+        audio_url = None
         if selected_song:
-            parts.append(f"已选择：{selected_song['name']} - {selected_song['artists']}")
+            parts.append(
+                f"已选择：{selected_song['name']} - {selected_song['artists']}"
+            )
         try:
-            url = await asyncio.to_thread(get_song_url, song_id, cookie=self.music_cookie)
-            parts.append(f"歌曲 ID：{song_id}\n播放直链：{url}")
+            lyrics = await asyncio.to_thread(
+                get_lyrics, song_id, cookie=self.music_cookie
+            )
+            lyric_parts = list(self._lyric_chunks(song_id, lyrics))
+        except (ValueError, MusicAPIError) as exc:
+            lyric_parts = [f"歌曲 ID：{song_id}\n获取歌词失败：{exc}"]
+        try:
+            audio_url = await get_playable_song_url(song_id, self.music_cookie)
+            parts.append(f"歌曲 ID：{song_id}\n播放直链：{audio_url}")
         except (ValueError, MusicAPIError) as exc:
             parts.append(f"歌曲 ID：{song_id}\n获取直链失败：{exc}")
-        try:
-            lyrics = await asyncio.to_thread(get_lyrics, song_id, cookie=self.music_cookie)
-            parts.extend(self._lyric_chunks(song_id, lyrics))
-        except (ValueError, MusicAPIError) as exc:
-            parts.append(f"歌曲 ID：{song_id}\n获取歌词失败：{exc}")
+        parts.extend(lyric_parts)
         bot_id = str(event.get_self_id() or "0")
         nodes = [
             Node(name="网易云音乐", uin=bot_id, content=[Plain(text=part)])
             for part in parts
         ]
-        yield event.chain_result([Nodes(nodes)])
+        await event.send(MessageChain([Nodes(nodes)]))
+        if audio_url:
+            try:
+                await event.send(MessageChain([Record.fromURL(audio_url)]))
+            except Exception:
+                logger.exception("Failed to send NetEase music voice message")
+                await event.send(
+                    MessageChain([Plain("语音发送失败，播放直链已在合并消息中。")])
+                )
 
     @filter.command("网易云帮助")
     async def help(self, event: AstrMessageEvent):
@@ -91,7 +106,7 @@ class MusicPlugin(Star):
             "网易云音乐命令：\n"
             "/网易云搜索 歌名或歌手（随后回复 1-4 选歌）\n"
             "/网易云链接 歌曲ID或含链接的文字\n"
-            "艾特机器人并附上网易云歌曲分享链接，也能获取直链和歌词。"
+            "群聊艾特机器人并附上歌曲链接，私聊直接发送歌曲链接，均可获取直链、歌词和语音。"
         )
 
     @filter.command("网易云搜索")
@@ -116,10 +131,15 @@ class MusicPlugin(Star):
         if not songs:
             yield event.plain_result("没有找到歌曲。")
             return
-        self._pending_selections[self._selection_key(event)] = (time.monotonic() + 300, songs)
+        self._pending_selections[self._selection_key(event)] = (
+            time.monotonic() + 300,
+            songs,
+        )
         lines = ["搜索结果："]
         for index, song in enumerate(songs, 1):
-            lines.append(f"{index}. {song['name']} - {song['artists']}（ID：{song['id']}）")
+            lines.append(
+                f"{index}. {song['name']} - {song['artists']}（ID：{song['id']}）"
+            )
         lines.append(f"请在 5 分钟内回复 1-{len(songs)} 选择歌曲。")
         yield event.plain_result("\n".join(lines))
 
@@ -130,12 +150,12 @@ class MusicPlugin(Star):
         except (ValueError, MusicAPIError) as exc:
             yield event.plain_result(f"解析歌曲失败：{exc}")
             return
-        async for result in self._song_results(event, song_id):
-            yield result
+        await self._send_song_results(event, song_id)
+        event.stop_event()
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def auto_link(self, event: AstrMessageEvent):
-        """处理搜索后的数字选择，以及艾特机器人时发送的歌曲分享链接。"""
+        """Handle song selections and links in private or mentioned group messages."""
         text = event.get_message_str().strip()
         if text in {"1", "2", "3", "4"}:
             key = self._selection_key(event)
@@ -152,16 +172,24 @@ class MusicPlugin(Star):
                     return
                 self._pending_selections.pop(key, None)
                 song = songs[index]
-                async for result in self._song_results(
+                await self._send_song_results(
                     event, int(song["id"]), selected_song=song
-                ):
-                    yield result
+                )
+                event.stop_event()
             return
-        if not self._is_at_bot(event) or not match_music_link(text):
+        if not match_music_link(text):
+            return
+        message_type = event.get_message_type()
+        if message_type == MessageType.GROUP_MESSAGE and not self._is_at_bot(event):
+            return
+        if message_type not in {MessageType.GROUP_MESSAGE, MessageType.FRIEND_MESSAGE}:
             return
         commands = (
-            "网易云搜索", "网易云链接", "网易云帮助",
-            "歌曲直链", "网易云音乐直链",
+            "网易云搜索",
+            "网易云链接",
+            "网易云帮助",
+            "歌曲直链",
+            "网易云音乐直链",
         )
         command_text = text.lstrip("/")
         if any(
@@ -174,6 +202,5 @@ class MusicPlugin(Star):
         except (ValueError, MusicAPIError) as exc:
             yield event.plain_result(f"解析网易云歌曲链接失败：{exc}")
             return
-        async for result in self._song_results(event, song_id):
-            yield result
+        await self._send_song_results(event, song_id)
         event.stop_event()

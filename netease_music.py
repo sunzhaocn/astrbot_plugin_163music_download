@@ -1,9 +1,10 @@
+import asyncio
 import os
 import re
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
 
+import aiohttp
 import requests
-
 
 BASE_URL = "https://music.163.com"
 HEADERS = {
@@ -30,8 +31,11 @@ _SHORT_LINK = re.compile(
 class MusicAPIError(Exception):
     pass
 
+
 def _cookie_header(cookie: str | None) -> str:
-    value = (cookie if cookie is not None else os.getenv("NETEASE_MUSIC_COOKIE", "")).strip()
+    value = (
+        cookie if cookie is not None else os.getenv("NETEASE_MUSIC_COOKIE", "")
+    ).strip()
     if not value:
         return ""
     if "=" not in value:
@@ -49,7 +53,9 @@ def _post(path: str, data: dict, cookie: str | None = None) -> dict:
     if cookie_value:
         headers["Cookie"] = cookie_value
     try:
-        response = requests.post(BASE_URL + path, data=data, headers=headers, timeout=TIMEOUT)
+        response = requests.post(
+            BASE_URL + path, data=data, headers=headers, timeout=TIMEOUT
+        )
         response.raise_for_status()
         payload = response.json()
     except (requests.RequestException, ValueError) as exc:
@@ -82,16 +88,21 @@ def resolve_short_link(code: str) -> int:
         raise ValueError("短链编码无效")
     short_url = f"https://163cn.tv/{code}"
     try:
-        response = requests.get(short_url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=False)
+        response = requests.get(
+            short_url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=False
+        )
         response.raise_for_status()
     except requests.RequestException as exc:
         raise MusicAPIError("短链解析失败，请稍后重试") from exc
     if response.status_code not in {301, 302, 303, 307, 308}:
         raise MusicAPIError("短链没有返回歌曲页面")
     target = urlparse(urljoin(short_url, response.headers.get("Location", "")))
-    if target.scheme != "https" or target.hostname not in {
-        "music.163.com", "m.music.163.com", "y.music.163.com"
-    } or not target.path.endswith("/song"):
+    if (
+        target.scheme != "https"
+        or target.hostname
+        not in {"music.163.com", "m.music.163.com", "y.music.163.com"}
+        or not target.path.endswith("/song")
+    ):
         raise MusicAPIError("短链没有指向网易云歌曲页面")
     ids = parse_qs(target.query).get("id", [])
     if not ids or not ids[0].isdecimal() or int(ids[0]) <= 0:
@@ -111,27 +122,35 @@ def parse_song_id(value: str | int) -> int:
     return resolve_short_link(link["value"])
 
 
-def search_songs(keyword: str, cookie: str | None = None, limit: int = 10) -> list[dict]:
+def search_songs(
+    keyword: str, cookie: str | None = None, limit: int = 10
+) -> list[dict]:
     """按关键词搜索单曲，返回包含 id、name、artists、album 的列表。"""
     if not keyword.strip():
         raise ValueError("搜索关键词不能为空")
     if not 1 <= limit <= 50:
         raise ValueError("limit 必须介于 1 到 50")
-    payload = _post("/api/cloudsearch/pc", {"s": keyword, "type": 1, "limit": limit}, cookie)
+    payload = _post(
+        "/api/cloudsearch/pc", {"s": keyword, "type": 1, "limit": limit}, cookie
+    )
     result = payload.get("result") or {}
     songs = result.get("songs") or []
     return [
         {
             "id": item["id"],
             "name": item.get("name", ""),
-            "artists": "/".join(artist.get("name", "") for artist in item.get("ar", [])),
+            "artists": "/".join(
+                artist.get("name", "") for artist in item.get("ar", [])
+            ),
             "album": (item.get("al") or {}).get("name", ""),
         }
         for item in songs
     ]
 
 
-def get_song_url(song_id: int, cookie: str | None = None, level: str = "standard") -> str:
+def get_song_url(
+    song_id: int, cookie: str | None = None, level: str = "standard"
+) -> str:
     song_id = parse_song_id(song_id)
     if level not in {"standard", "exhigh", "lossless", "hires"}:
         raise ValueError("不支持的音质等级")
@@ -147,6 +166,80 @@ def get_song_url(song_id: int, cookie: str | None = None, level: str = "standard
     return url
 
 
+async def check_song_url_status(url: str) -> int:
+    """Check the URL with the same HTTP client used by AstrBot audio delivery.
+
+    Args:
+        url: Audio URL returned by the NetEase player API.
+
+    Returns:
+        HTTP status code from the audio server.
+
+    Raises:
+        MusicAPIError: The URL is invalid or the status cannot be checked.
+    """
+    if urlparse(url).scheme not in {"http", "https"}:
+        raise MusicAPIError("音频直链无效")
+    try:
+        async with aiohttp.ClientSession(trust_env=True) as session:
+            async with session.get(
+                url, timeout=aiohttp.ClientTimeout(total=TIMEOUT)
+            ) as response:
+                return response.status
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        raise MusicAPIError("音频直链状态检查失败，请稍后重试") from exc
+
+
+async def get_playable_song_url(song_id: int, cookie: str = "") -> str:
+    """Find an audio URL that AstrBot can fetch successfully.
+
+    Args:
+        song_id: NetEase song ID.
+        cookie: Configured NetEase Cookie, if any.
+
+    Returns:
+        A verified audio URL.
+
+    Raises:
+        MusicAPIError: No generated URL or known CDN alternative is accessible.
+    """
+    rejected_urls = []
+    last_error = None
+    for cookie_value in (cookie, "") if cookie else ("",):
+        try:
+            url = await asyncio.to_thread(get_song_url, song_id, cookie=cookie_value)
+            status = await check_song_url_status(url)
+        except (ValueError, MusicAPIError) as exc:
+            last_error = exc
+            continue
+        if status == 200:
+            return url
+        if status == 403:
+            rejected_urls.append(url)
+        else:
+            last_error = MusicAPIError(f"音频直链返回 HTTP {status}")
+
+    for url in rejected_urls:
+        parsed = urlparse(url)
+        if not re.fullmatch(r"m\d+\.music\.126\.net", parsed.hostname or ""):
+            continue
+        for host in ("m701.music.126.net", "m801.music.126.net"):
+            if host == parsed.hostname:
+                continue
+            alternative = urlunparse(parsed._replace(netloc=host))
+            try:
+                if await check_song_url_status(alternative) == 200:
+                    return alternative
+            except MusicAPIError as exc:
+                last_error = exc
+
+    if rejected_urls:
+        raise MusicAPIError("音频直链及备用 CDN 均返回 403，请稍后重试")
+    if last_error is not None:
+        raise MusicAPIError(str(last_error)) from last_error
+    raise MusicAPIError("没有可用音频直链")
+
+
 def get_lyrics(song_id: int, cookie: str | None = None) -> dict[str, str]:
     song_id = parse_song_id(song_id)
     payload = _post(
@@ -158,4 +251,3 @@ def get_lyrics(song_id: int, cookie: str | None = None) -> dict[str, str]:
         "original": (payload.get("lrc") or {}).get("lyric", ""),
         "translated": (payload.get("tlyric") or {}).get("lyric", ""),
     }
-
